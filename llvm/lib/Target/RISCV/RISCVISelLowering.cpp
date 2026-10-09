@@ -14778,6 +14778,83 @@ static SDValue widenVectorOpsToi8(SDValue N, const SDLoc &DL,
   return TruncVals.front();
 }
 
+/// Spill fixed-length VECTOR_DEINTERLEAVE operands contiguously to a stack
+/// temporary. Operands are consecutive slices of the interleaved input, so
+/// storing them in order reconstructs that layout for a following vlseg.
+static std::tuple<SDValue, SDValue, MachinePointerInfo, Align>
+spillFixedDeinterleaveOperands(SDValue Op, const SDLoc &DL, SelectionDAG &DAG,
+                               MVT VecVT, unsigned Factor) {
+  MVT ElemVT = VecVT.getVectorElementType();
+  auto &MF = DAG.getMachineFunction();
+  SDValue Chain = DAG.getEntryNode();
+  Align Alignment = DAG.getReducedAlign(VecVT, /*UseABI=*/false);
+  ElementCount ActualConcatEC = VecVT.getVectorElementCount() * Factor;
+  EVT ConcatEVT = EVT::getVectorVT(*DAG.getContext(), ElemVT, ActualConcatEC);
+  SDValue StackPtr =
+      DAG.CreateStackTemporary(ConcatEVT.getStoreSize(), Alignment);
+  auto FrameIndex = cast<FrameIndexSDNode>(StackPtr.getNode())->getIndex();
+  MachinePointerInfo PtrInfo =
+      MachinePointerInfo::getFixedStack(MF, FrameIndex);
+
+  TypeSize VecSize = VecVT.getStoreSize();
+  SDValue BasePtr = StackPtr;
+  MachinePointerInfo PI = PtrInfo;
+  SmallVector<SDValue, 8> Tokens(Factor);
+  for (auto [Idx, FieldOp] : enumerate(Op->op_values())) {
+    if (Idx) {
+      BasePtr = DAG.getObjectPtrOffset(DL, BasePtr, VecSize);
+      PI = PI.getWithOffset(VecSize);
+    }
+    Tokens[Idx] = DAG.getStore(Chain, DL, FieldOp, BasePtr, PI, Alignment);
+  }
+  return {DAG.getTokenFactor(DL, Tokens), StackPtr, PtrInfo, Alignment};
+}
+
+/// Reload Factor deinterleaved fields from Ptr with a masked vlseg.
+/// Optionally convert each field from the scalable container to FixedVT.
+static SDValue vlsegDeinterleaveFields(
+    SelectionDAG &DAG, const RISCVSubtarget &Subtarget, const SDLoc &DL,
+    unsigned Factor, MVT ContainerFieldVT, EVT MemEltVT, SDValue Chain,
+    SDValue Ptr, MachinePointerInfo PtrInfo, Align Alignment, SDValue Mask,
+    SDValue VL, MVT PassthruVT, std::optional<MVT> FixedVT,
+    SmallVectorImpl<SDValue> &Fields) {
+  MVT XLenVT = Subtarget.getXLenVT();
+  static const Intrinsic::ID VlsegIntrinsicsIds[] = {
+      Intrinsic::riscv_vlseg2_mask, Intrinsic::riscv_vlseg3_mask,
+      Intrinsic::riscv_vlseg4_mask, Intrinsic::riscv_vlseg5_mask,
+      Intrinsic::riscv_vlseg6_mask, Intrinsic::riscv_vlseg7_mask,
+      Intrinsic::riscv_vlseg8_mask};
+
+  SDValue LoadOps[] = {
+      Chain,
+      DAG.getTargetConstant(VlsegIntrinsicsIds[Factor - 2], DL, XLenVT),
+      DAG.getUNDEF(PassthruVT),
+      Ptr,
+      Mask,
+      VL,
+      DAG.getTargetConstant(
+          RISCVVType::TAIL_AGNOSTIC | RISCVVType::MASK_AGNOSTIC, DL, XLenVT),
+      DAG.getTargetConstant(Log2_64(MemEltVT.getScalarSizeInBits()), DL,
+                            XLenVT)};
+
+  unsigned Sz = Factor * ContainerFieldVT.getVectorMinNumElements() *
+                ContainerFieldVT.getScalarSizeInBits();
+  EVT VecTupTy = MVT::getRISCVVectorTupleVT(Sz, Factor);
+  SDValue Load = DAG.getMemIntrinsicNode(
+      ISD::INTRINSIC_W_CHAIN, DL, DAG.getVTList({VecTupTy, MVT::Other}),
+      LoadOps, MemEltVT, PtrInfo, Alignment, MachineMemOperand::MOLoad,
+      LocationSize::beforeOrAfterPointer());
+
+  for (unsigned i = 0; i != Factor; ++i) {
+    SDValue Field = DAG.getNode(RISCVISD::TUPLE_EXTRACT, DL, ContainerFieldVT,
+                                Load, DAG.getTargetConstant(i, DL, MVT::i32));
+    if (FixedVT)
+      Field = convertFromScalableVector(*FixedVT, Field, DAG, Subtarget);
+    Fields.push_back(Field);
+  }
+  return Load.getValue(1);
+}
+
 SDValue RISCVTargetLowering::lowerVECTOR_DEINTERLEAVE(SDValue Op,
                                                       SelectionDAG &DAG) const {
   SDLoc DL(Op);
@@ -14797,8 +14874,8 @@ SDValue RISCVTargetLowering::lowerVECTOR_DEINTERLEAVE(SDValue Op,
     ContainerVecVT = getContainerForFixedLengthVector(VecVT);
 
   // Scalable vectors that would exceed LMUL=8 split into smaller
-  // VECTOR_DEINTERLEAVE nodes. Fixed-length vectors use the generic
-  // store+vlseg path below (#222938).
+  // VECTOR_DEINTERLEAVE nodes and are lowered recursively. Fixed-length
+  // vectors fall through to the generic store+vlseg path (#222938).
   if (!IsFixedVector && (ContainerVecVT.getSizeInBits().getKnownMinValue() *
                          Factor) > (8 * RISCV::RVVBitsPerBlock)) {
     SmallVector<SDValue, 8> Ops(Factor * 2);
@@ -14839,6 +14916,9 @@ SDValue RISCVTargetLowering::lowerVECTOR_DEINTERLEAVE(SDValue Op,
     }
   }
 
+  // Scalable special lowerings (vnsrl / vcompress) and the scalable generic
+  // path. Fixed-length uses the chunked store+vlseg below, so a full concat
+  // MVT is never built for it.
   if (!IsFixedVector) {
     SmallVector<SDValue, 8> Ops(Op->op_values());
 
@@ -14911,39 +14991,13 @@ SDValue RISCVTargetLowering::lowerVECTOR_DEINTERLEAVE(SDValue Op,
         ConcatVT.getVectorElementType(), PtrInfo, Alignment,
         MachineMemOperand::MOStore, LocationSize::beforeOrAfterPointer());
 
-    SDValue Passthru = DAG.getUNDEF(ConcatVT);
-    static const Intrinsic::ID VlsegIntrinsicsIds[] = {
-        Intrinsic::riscv_vlseg2_mask, Intrinsic::riscv_vlseg3_mask,
-        Intrinsic::riscv_vlseg4_mask, Intrinsic::riscv_vlseg5_mask,
-        Intrinsic::riscv_vlseg6_mask, Intrinsic::riscv_vlseg7_mask,
-        Intrinsic::riscv_vlseg8_mask};
+    // Load it back with segmented load.
+    SmallVector<SDValue, 8> Res;
+    vlsegDeinterleaveFields(DAG, Subtarget, DL, Factor, ContainerVecVT,
+                            ConcatVT.getVectorElementType(), Chain, StackPtr,
+                            PtrInfo, Alignment, Mask, VL, ConcatVT,
+                            std::nullopt, Res);
 
-    SDValue LoadOps[] = {
-        Chain,
-        DAG.getTargetConstant(VlsegIntrinsicsIds[Factor - 2], DL, XLenVT),
-        Passthru,
-        StackPtr,
-        Mask,
-        VL,
-        DAG.getTargetConstant(
-            RISCVVType::TAIL_AGNOSTIC | RISCVVType::MASK_AGNOSTIC, DL, XLenVT),
-        DAG.getTargetConstant(Log2_64(VecVT.getScalarSizeInBits()), DL,
-                              XLenVT)};
-
-    unsigned Sz = Factor * ContainerVecVT.getVectorMinNumElements() *
-                  ContainerVecVT.getScalarSizeInBits();
-    EVT VecTupTy = MVT::getRISCVVectorTupleVT(Sz, Factor);
-
-    SDValue Load = DAG.getMemIntrinsicNode(
-        ISD::INTRINSIC_W_CHAIN, DL, DAG.getVTList({VecTupTy, MVT::Other}),
-        LoadOps, ConcatVT.getVectorElementType(), PtrInfo, Alignment,
-        MachineMemOperand::MOLoad, LocationSize::beforeOrAfterPointer());
-
-    SmallVector<SDValue, 8> Res(Factor);
-    for (unsigned i = 0; i != Factor; ++i) {
-      Res[i] = DAG.getNode(RISCVISD::TUPLE_EXTRACT, DL, ContainerVecVT, Load,
-                           DAG.getTargetConstant(i, DL, MVT::i32));
-    }
     return DAG.getMergeValues(Res, DL);
   }
 
@@ -14958,48 +15012,20 @@ SDValue RISCVTargetLowering::lowerVECTOR_DEINTERLEAVE(SDValue Op,
     LoadContainerVecVT = getContainerForFixedLengthVector(LoadVecVT);
   }
 
-  MVT ElemVT = VecVT.getVectorElementType();
-  auto &MF = DAG.getMachineFunction();
-  SDValue Chain = DAG.getEntryNode();
-  Align Alignment = DAG.getReducedAlign(VecVT, /*UseABI=*/false);
-  ElementCount ActualConcatEC = VecVT.getVectorElementCount() * Factor;
-  EVT ConcatEVT = EVT::getVectorVT(*DAG.getContext(), ElemVT, ActualConcatEC);
-  SDValue StackPtr =
-      DAG.CreateStackTemporary(ConcatEVT.getStoreSize(), Alignment);
-  auto FrameIndex = cast<FrameIndexSDNode>(StackPtr.getNode())->getIndex();
-  MachinePointerInfo PtrInfo =
-      MachinePointerInfo::getFixedStack(MF, FrameIndex);
-
-  TypeSize VecSize = VecVT.getStoreSize();
-  SDValue BasePtr = StackPtr;
-  MachinePointerInfo PI = PtrInfo;
-  SmallVector<SDValue, 8> Tokens(Factor);
-  for (auto [Idx, FieldOp] : enumerate(Op->op_values())) {
-    if (Idx) {
-      BasePtr = DAG.getObjectPtrOffset(DL, BasePtr, VecSize);
-      PI = PI.getWithOffset(VecSize);
-    }
-    Tokens[Idx] = DAG.getStore(Chain, DL, FieldOp, BasePtr, PI, Alignment);
-  }
-  Chain = DAG.getTokenFactor(DL, Tokens);
-
+  auto [Chain, StackPtr, PtrInfo, Alignment] =
+      spillFixedDeinterleaveOperands(Op, DL, DAG, VecVT, Factor);
   auto [Mask, VL] =
       getDefaultVLOps(LoadVecVT, LoadContainerVecVT, DL, DAG, Subtarget);
 
+  MVT ElemVT = VecVT.getVectorElementType();
   MVT WideVT = MVT::getVectorVT(ElemVT, LoadVecVT.getVectorNumElements() *
                                             PowerOf2Ceil(Factor));
   MVT WideContainer = getContainerForFixedLengthVector(WideVT);
+
   const unsigned NumChunks =
       VecVT.getVectorNumElements() / LoadVecVT.getVectorNumElements();
   const uint64_t ChunkBytes =
       static_cast<uint64_t>(Factor) * LoadVecVT.getStoreSize().getFixedValue();
-
-  MVT XLenVT = Subtarget.getXLenVT();
-  static const Intrinsic::ID VlsegIntrinsicsIds[] = {
-      Intrinsic::riscv_vlseg2_mask, Intrinsic::riscv_vlseg3_mask,
-      Intrinsic::riscv_vlseg4_mask, Intrinsic::riscv_vlseg5_mask,
-      Intrinsic::riscv_vlseg6_mask, Intrinsic::riscv_vlseg7_mask,
-      Intrinsic::riscv_vlseg8_mask};
 
   SmallVector<SmallVector<SDValue, 4>, 8> Parts(Factor);
   for (unsigned Part = 0; Part != NumChunks; ++Part) {
@@ -15014,34 +15040,12 @@ SDValue RISCVTargetLowering::lowerVECTOR_DEINTERLEAVE(SDValue Op,
       ChunkAlign = commonAlignment(Alignment, ByteOff);
     }
 
-    SDValue LoadOps[] = {
-        Chain,
-        DAG.getTargetConstant(VlsegIntrinsicsIds[Factor - 2], DL, XLenVT),
-        DAG.getUNDEF(WideContainer),
-        ChunkPtr,
-        Mask,
-        VL,
-        DAG.getTargetConstant(
-            RISCVVType::TAIL_AGNOSTIC | RISCVVType::MASK_AGNOSTIC, DL, XLenVT),
-        DAG.getTargetConstant(Log2_64(ElemVT.getScalarSizeInBits()), DL,
-                              XLenVT)};
-
-    unsigned Sz = Factor * LoadContainerVecVT.getVectorMinNumElements() *
-                  LoadContainerVecVT.getScalarSizeInBits();
-    EVT VecTupTy = MVT::getRISCVVectorTupleVT(Sz, Factor);
-    SDValue Load = DAG.getMemIntrinsicNode(
-        ISD::INTRINSIC_W_CHAIN, DL, DAG.getVTList({VecTupTy, MVT::Other}),
-        LoadOps, ElemVT, ChunkPI, ChunkAlign, MachineMemOperand::MOLoad,
-        LocationSize::beforeOrAfterPointer());
-    Chain = Load.getValue(1);
-
-    for (unsigned I = 0; I != Factor; ++I) {
-      SDValue Field =
-          DAG.getNode(RISCVISD::TUPLE_EXTRACT, DL, LoadContainerVecVT, Load,
-                      DAG.getTargetConstant(I, DL, MVT::i32));
-      Parts[I].push_back(
-          convertFromScalableVector(LoadVecVT, Field, DAG, Subtarget));
-    }
+    SmallVector<SDValue, 8> Fields;
+    Chain = vlsegDeinterleaveFields(
+        DAG, Subtarget, DL, Factor, LoadContainerVecVT, ElemVT, Chain, ChunkPtr,
+        ChunkPI, ChunkAlign, Mask, VL, WideContainer, LoadVecVT, Fields);
+    for (unsigned I = 0; I != Factor; ++I)
+      Parts[I].push_back(Fields[I]);
   }
 
   SmallVector<SDValue, 8> Res(Factor);
